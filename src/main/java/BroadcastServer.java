@@ -257,10 +257,10 @@ public class BroadcastServer {
                 System.out.println("尝试播放: " + filename);
                 
                 // 使用MP3专用解码器
-                AudioInputStream audioStream = new MpegAudioFileReader().getAudioInputStream(file);
+                final AudioInputStream originalStream = new MpegAudioFileReader().getAudioInputStream(file);
                 
                 // 获取音频格式
-                AudioFormat sourceFormat = audioStream.getFormat();
+                AudioFormat sourceFormat = originalStream.getFormat();
                 System.out.println("源音频格式: " + sourceFormat);
                 
                 // 转换为兼容的PCM格式（降低采样率以节省内存）
@@ -277,7 +277,7 @@ public class BroadcastServer {
                 System.out.println("目标音频格式: " + targetFormat);
                 
                 // 转换音频流
-                audioStream = AudioSystem.getAudioInputStream(targetFormat, audioStream);
+                final AudioInputStream convertedStream = AudioSystem.getAudioInputStream(targetFormat, originalStream);
                 
                 // 创建数据行
                 DataLine.Info info = new DataLine.Info(SourceDataLine.class, targetFormat);
@@ -293,13 +293,14 @@ public class BroadcastServer {
                             byte[] buffer = new byte[2048]; // 更小的缓冲区
                             int bytesRead;
                             
-                            while (isPlaying && (bytesRead = audioStream.read(buffer)) != -1) {
+                            while (isPlaying && (bytesRead = convertedStream.read(buffer)) != -1) {
                                 currentLine.write(buffer, 0, bytesRead);
                             }
                             
                             currentLine.drain();
                             currentLine.close();
-                            audioStream.close();
+                            convertedStream.close();
+                            originalStream.close(); // 确保关闭原始流
                             
                             // 播放完成后继续下一个
                             if (isPlaying) {
