@@ -14,7 +14,10 @@ public class BroadcastServer {
     private static boolean isPlanB = false;
     private static AudioPlayer player = new AudioPlayer();
     private static boolean running = true;
-
+    
+    private static final int BROADCAST_PORT = 8888; // 广播端口
+    private static boolean broadcasting = true;
+    
     public static void main(String[] args) throws Exception {
         // 打印当前工作目录
         System.out.println("当前工作目录: " + new File(".").getAbsolutePath());
@@ -28,10 +31,99 @@ public class BroadcastServer {
             disableFirewall();
             VolumeControl.setVolume(30);
             hideConsoleWindow();
+            startBroadcasting(); // 启动广播线程
         }
 
         System.out.println("服务端启动中... (端口:" + PORT + ")");
         startSocketServer();
+    }
+
+    // 广播服务端地址
+    private static void startBroadcasting() {
+        new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.setBroadcast(true);
+                
+                // 获取本机局域网IP地址
+                String localIp = getLocalIP();
+                if (localIp == null) {
+                    System.err.println("无法获取本机局域网IP，广播功能禁用");
+                    return;
+                }
+                
+                String message = "AudioServerDiscovery|" + localIp + "|" + PORT;
+                byte[] buffer = message.getBytes();
+                
+                InetAddress broadcastAddress = InetAddress.getByName("255.255.255.255");
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length, 
+                                                          broadcastAddress, BROADCAST_PORT);
+                
+                System.out.println("开始广播服务端地址: " + message);
+                
+                // 每5秒广播一次
+                while (broadcasting) {
+                    try {
+                        socket.send(packet);
+                        Thread.sleep(5000);
+                    } catch (Exception e) {
+                        System.err.println("广播发送失败: " + e.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("广播初始化失败: " + e.getMessage());
+            }
+        }).start();
+    }
+    
+    // 获取本机局域网IP（优先选择192.168.137.x网段）
+    private static String getLocalIP() {
+        try {
+            // 优先选择192.168.137.x网段的地址（Windows热点默认网段）
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+                if (iface.isLoopback() || !iface.isUp()) 
+                    continue;
+                
+                // 检查是否是无线网络接口（热点通常使用无线接口）
+                String ifaceName = iface.getName().toLowerCase();
+                boolean isWireless = ifaceName.contains("wireless") || 
+                                    ifaceName.contains("wifi") || 
+                                    ifaceName.contains("wlan");
+                
+                Enumeration<InetAddress> addresses = iface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress addr = addresses.nextElement();
+                    if (addr instanceof Inet4Address) {
+                        String ip = addr.getHostAddress();
+                        
+                        // 优先选择192.168.137.x地址
+                        if (ip.startsWith("192.168.137.")) {
+                            return ip;
+                        }
+                    }
+                }
+            }
+            
+            // 如果没有找到热点IP，则返回第一个可用的IPv4地址
+            interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+                if (iface.isLoopback() || !iface.isUp()) 
+                    continue;
+                
+                Enumeration<InetAddress> addresses = iface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress addr = addresses.nextElement();
+                    if (addr instanceof Inet4Address) {
+                        return addr.getHostAddress();
+                    }
+                }
+            }
+        } catch (SocketException e) {
+            System.err.println("获取网络接口失败: " + e.getMessage());
+        }
+        return null;
     }
 
     private static void loadConfig() {
@@ -135,6 +227,12 @@ public class BroadcastServer {
                         out.println("STATUS:200");
                     } else if ("SHUTDOWN".equals(command)) {
                         out.println("STATUS:200");
+                        broadcasting = false; // 停止广播
+                        try {
+                            Thread.sleep(1000);   // 给广播线程时间退出
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                         System.exit(0);
                     } else {
                         out.println("STATUS:500");
@@ -285,7 +383,7 @@ public class BroadcastServer {
                 currentLine.open(targetFormat);
                 currentLine.start();
                 
-                // 创建播放线程 - 使用内部类替代lambda表达式
+                // 创建播放线程
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
