@@ -1,12 +1,10 @@
 import java.io.*;
 import java.net.*;
 import java.util.*;
-import javax.sound.sampled.*;
 import javax.swing.*;
 import com.sun.jna.*;
 import com.sun.jna.platform.win32.WinDef;
 import com.sun.jna.win32.StdCallLibrary;
-import javazoom.spi.mpeg.sampled.file.MpegAudioFileReader;
 
 public class BroadcastServer {
     private static final String CONFIG_FILE = "server.cfg";
@@ -252,13 +250,53 @@ public class BroadcastServer {
 
     static class AudioPlayer {
         private volatile boolean isPlaying = false;
+        private volatile boolean isPaused = false;
         private List<String> playlist = new ArrayList<>();
         private int currentIndex = -1;
         private java.util.Timer timer;
-        private SourceDataLine currentLine;
+        
+        // 用于ffplay播放控制
+        private Process ffplayProcess;
+        private String currentPlayingFile = null;
+        private Thread playThread;
+        private long pausePosition = 0; // 暂停位置（毫秒）
+        private String ffplayPath;
+        private long playbackStartTime; // 记录播放开始时间
 
         public AudioPlayer() {
+            // 尝试在同目录下查找ffplay或ffmpeg
+            ffplayPath = findFFplay();
             loadPlaylist();
+        }
+
+        private String findFFplay() {
+            // 检查当前目录下的ffplay.exe或ffmpeg.exe
+            File currentDir = new File(".");
+            File[] files = currentDir.listFiles();
+            
+            if (files != null) {
+                for (File file : files) {
+                    String name = file.getName().toLowerCase();
+                    if (name.equals("ffplay.exe") || name.equals("ffmpeg.exe")) {
+                        return file.getAbsolutePath();
+                    }
+                }
+            }
+            
+            // 如果在当前目录没找到，尝试在PATH中查找
+            String path = System.getenv("PATH");
+            if (path != null) {
+                String[] paths = path.split(File.pathSeparator);
+                for (String p : paths) {
+                    File ffplay = new File(p, "ffplay.exe");
+                    if (ffplay.exists()) return ffplay.getAbsolutePath();
+                    
+                    File ffmpeg = new File(p, "ffmpeg.exe");
+                    if (ffmpeg.exists()) return ffmpeg.getAbsolutePath();
+                }
+            }
+            
+            return null;
         }
 
         private void loadPlaylist() {
@@ -276,7 +314,9 @@ public class BroadcastServer {
             
             if (audioDir.exists() && audioDir.isDirectory()) {
                 File[] files = audioDir.listFiles((dir, name) -> 
-                    name.toLowerCase().endsWith(".mp3"));
+                    name.toLowerCase().endsWith(".mp3") || 
+                    name.toLowerCase().endsWith(".wav") || 
+                    name.toLowerCase().endsWith(".ogg"));
                 
                 if (files != null && files.length > 0) {
                     // 按文件名首字母排序
@@ -287,7 +327,7 @@ public class BroadcastServer {
                     }
                     System.out.println("加载播放列表: " + playlist.size() + " 个文件");
                 } else {
-                    System.err.println("音频目录为空，请添加MP3文件");
+                    System.err.println("音频目录为空，请添加音频文件");
                 }
             } else {
                 System.err.println("音频目录不存在: " + audioDir.getAbsolutePath());
@@ -300,6 +340,13 @@ public class BroadcastServer {
                 return;
             }
             
+            // 如果当前处于暂停状态，则继续播放
+            if (isPaused && currentPlayingFile != null) {
+                resume();
+                return;
+            }
+            
+            // 如果停止后再次播放，从头开始
             stop();
             currentIndex = 0;
             playNext();
@@ -338,7 +385,20 @@ public class BroadcastServer {
         }
 
         public void play(String filename) {
+            // 如果请求播放的文件与当前暂停的文件相同，则继续播放
+            if (isPaused && filename.equals(currentPlayingFile)) {
+                resume();
+                return;
+            }
+            
+            // 否则开始新的播放
             stop();
+            
+            if (ffplayPath == null) {
+                System.err.println("未找到ffplay或ffmpeg，无法播放音频");
+                return;
+            }
+            
             try {
                 // 使用绝对路径
                 String audioPath = new File(".").getAbsolutePath() + File.separator + "audio" + File.separator;
@@ -352,53 +412,52 @@ public class BroadcastServer {
                     return;
                 }
                 
-                System.out.println("尝试播放: " + filename);
+                System.out.println("尝试播放: " + filename + " 使用: " + ffplayPath);
                 
-                // 使用MP3专用解码器
-                final AudioInputStream originalStream = new MpegAudioFileReader().getAudioInputStream(file);
+                // 构建ffplay命令
+                List<String> command = new ArrayList<>();
+                command.add(ffplayPath);
+                command.add("-nodisp");   // 不显示窗口
+                command.add("-autoexit"); // 播放完成后自动退出
+                command.add("-loglevel"); // 减少日志输出
+                command.add("quiet");
+                command.add("\"" + file.getAbsolutePath() + "\""); // 添加引号处理路径空格
                 
-                // 获取音频格式
-                AudioFormat sourceFormat = originalStream.getFormat();
-                System.out.println("源音频格式: " + sourceFormat);
+                // 启动ffplay进程
+                ProcessBuilder pb = new ProcessBuilder(command);
+                ffplayProcess = pb.start();
                 
-                // 转换为兼容的PCM格式（降低采样率以节省内存）
-                AudioFormat targetFormat = new AudioFormat(
-                    AudioFormat.Encoding.PCM_SIGNED,
-                    22050, // 降低采样率到22.05kHz
-                    16,
-                    sourceFormat.getChannels(),
-                    sourceFormat.getChannels() * 2,
-                    22050, // 降低采样率到22.05kHz
-                    false
-                );
+                // 保存当前播放的文件
+                currentPlayingFile = filename;
+                isPlaying = true;
+                isPaused = false;
+                pausePosition = 0;
+                playbackStartTime = System.currentTimeMillis(); // 记录开始时间
                 
-                System.out.println("目标音频格式: " + targetFormat);
-                
-                // 转换音频流
-                final AudioInputStream convertedStream = AudioSystem.getAudioInputStream(targetFormat, originalStream);
-                
-                // 创建数据行
-                DataLine.Info info = new DataLine.Info(SourceDataLine.class, targetFormat);
-                currentLine = (SourceDataLine) AudioSystem.getLine(info);
-                currentLine.open(targetFormat);
-                currentLine.start();
-                
-                // 创建播放线程
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            byte[] buffer = new byte[2048]; // 更小的缓冲区
-                            int bytesRead;
+                // 创建监控线程
+                playThread = new Thread(() -> {
+                    try {
+                        // 等待进程结束
+                        int exitCode = ffplayProcess.waitFor();
+                        
+                        if (exitCode != 0) {
+                            System.err.println("ffplay播放失败，退出码: " + exitCode);
                             
-                            while (isPlaying && (bytesRead = convertedStream.read(buffer)) != -1) {
-                                currentLine.write(buffer, 0, bytesRead);
+                            // 读取错误流
+                            try (BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(ffplayProcess.getErrorStream()))) {
+                                String line;
+                                while ((line = reader.readLine()) != null) {
+                                    System.err.println("FFPLAY ERROR: " + line);
+                                }
+                            } catch (IOException e) {
+                                // 忽略
                             }
-                            
-                            currentLine.drain();
-                            currentLine.close();
-                            convertedStream.close();
-                            originalStream.close(); // 确保关闭原始流
+                        }
+                        
+                        // 如果播放完成（不是暂停或停止）
+                        if (isPlaying && !isPaused) {
+                            System.out.println("文件播放完成: " + currentPlayingFile);
                             
                             // 播放完成后继续下一个
                             if (isPlaying) {
@@ -408,48 +467,171 @@ public class BroadcastServer {
                                     playNext();
                                 } else {
                                     System.out.println("所有文件播放完毕");
+                                    // 重置播放状态
+                                    resetPlayState();
                                 }
                             }
-                        } catch (IOException e) {
-                            System.err.println("播放失败: " + e.getMessage());
                         }
+                    } catch (InterruptedException e) {
+                        System.err.println("播放线程被中断: " + e.getMessage());
                     }
-                }).start();
+                });
                 
-                isPlaying = true;
+                playThread.start();
                 System.out.println("成功播放: " + filename);
             } catch (Exception e) {
                 System.err.println("播放失败: " + e.getMessage());
                 e.printStackTrace();
+                resetPlayState();
+            }
+        }
+        
+        // 继续播放（从暂停位置）
+        private void resume() {
+            if (!isPaused || currentPlayingFile == null) {
+                System.err.println("没有暂停的播放可以恢复");
+                return;
+            }
+            
+            if (ffplayPath == null) {
+                System.err.println("未找到ffplay或ffmpeg，无法播放音频");
+                return;
+            }
+            
+            try {
+                System.out.println("恢复播放: " + currentPlayingFile + " 从位置: " + pausePosition + "ms");
+                
+                // 使用绝对路径
+                String audioPath = new File(".").getAbsolutePath() + File.separator + "audio" + File.separator;
+                File file = new File(audioPath + currentPlayingFile);
+                
+                if (!file.exists()) {
+                    System.err.println("音频文件不存在: " + file.getAbsolutePath());
+                    return;
+                }
+                
+                // 构建ffplay命令（带起始位置）
+                List<String> command = new ArrayList<>();
+                command.add(ffplayPath);
+                command.add("-nodisp");
+                command.add("-autoexit");
+                command.add("-ss");
+                command.add(String.valueOf(pausePosition / 1000.0)); // 转换为秒
+                command.add("\"" + file.getAbsolutePath() + "\""); // 添加引号处理路径空格
+                
+                // 启动ffplay进程
+                ProcessBuilder pb = new ProcessBuilder(command);
+                ffplayProcess = pb.start();
+                
+                isPlaying = true;
+                isPaused = false;
+                playbackStartTime = System.currentTimeMillis(); // 记录开始时间
+                
+                // 创建监控线程
+                playThread = new Thread(() -> {
+                    try {
+                        // 等待进程结束
+                        int exitCode = ffplayProcess.waitFor();
+                        
+                        if (exitCode != 0) {
+                            System.err.println("ffplay播放失败，退出码: " + exitCode);
+                            
+                            // 读取错误流
+                            try (BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(ffplayProcess.getErrorStream()))) {
+                                String line;
+                                while ((line = reader.readLine()) != null) {
+                                    System.err.println("FFPLAY ERROR: " + line);
+                                }
+                            } catch (IOException e) {
+                                // 忽略
+                            }
+                        }
+                        
+                        // 如果播放完成（不是暂停或停止）
+                        if (isPlaying && !isPaused) {
+                            System.out.println("文件播放完成: " + currentPlayingFile);
+                            
+                            // 播放完成后继续下一个
+                            if (isPlaying) {
+                                int nextIndex = currentIndex + 1;
+                                if (nextIndex < playlist.size()) {
+                                    currentIndex = nextIndex;
+                                    playNext();
+                                } else {
+                                    System.out.println("所有文件播放完毕");
+                                    // 重置播放状态
+                                    resetPlayState();
+                                }
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        System.err.println("播放线程被中断: " + e.getMessage());
+                    }
+                });
+                
+                playThread.start();
+                System.out.println("成功恢复播放: " + currentPlayingFile);
+            } catch (Exception e) {
+                System.err.println("恢复播放失败: " + e.getMessage());
+                e.printStackTrace();
+                resetPlayState();
             }
         }
 
         public void pause() {
-            if (currentLine != null && currentLine.isRunning()) {
-                currentLine.stop();
+            if (isPlaying && !isPaused) {
+                // 计算实际播放时长 = 当前时间 - 开始时间
+                long elapsed = System.currentTimeMillis() - playbackStartTime;
+                pausePosition += elapsed; // 累加实际播放时长
+                
                 isPlaying = false;
+                isPaused = true;
+                
+                System.out.println("暂停播放: " + currentPlayingFile + " 位置: " + pausePosition + "ms");
+                
+                // 停止ffplay进程
+                if (ffplayProcess != null && ffplayProcess.isAlive()) {
+                    ffplayProcess.destroy();
+                }
+                
+                // 取消定时器
                 if (timer != null) {
                     timer.cancel();
+                    timer = null;
                 }
             }
         }
 
         public void stop() {
             isPlaying = false;
-            if (currentLine != null) {
-                currentLine.stop();
-                currentLine.close();
-                currentLine = null;
+            isPaused = false;
+            pausePosition = 0;
+            
+            System.out.println("停止播放");
+            
+            // 停止ffplay进程
+            if (ffplayProcess != null && ffplayProcess.isAlive()) {
+                ffplayProcess.destroy();
             }
+            
+            // 取消定时器
             if (timer != null) {
                 timer.cancel();
                 timer = null;
             }
+            
+            // 重置播放索引
             currentIndex = -1;
+            currentPlayingFile = null;
         }
-
-        public boolean isPlaying() {
-            return isPlaying;
+        
+        // 重置播放状态
+        private void resetPlayState() {
+            currentPlayingFile = null;
+            pausePosition = 0;
+            isPlaying = false;
+            isPaused = false;
         }
     }
 
